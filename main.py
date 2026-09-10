@@ -2,7 +2,7 @@ import os
 import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
 import requests
@@ -397,18 +397,27 @@ def run_bot():
         time.sleep(15)
 
 
+BODY = b"MLB alert bot is running"
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     """Render web services require an open port or the deploy is killed."""
 
-    def do_GET(self):
+    protocol_version = "HTTP/1.1"
+
+    def _send_headers(self):
+        # Content-Length is required, or proxies treat the reply as invalid.
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(BODY)))
         self.end_headers()
-        self.wfile.write(b"MLB alert bot is running")
+
+    def do_GET(self):
+        self._send_headers()
+        self.wfile.write(BODY)
 
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self._send_headers()
 
     def log_message(self, *args):
         pass  # keep Render logs readable
@@ -419,4 +428,4 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 10000))
     log(f"Health server listening on port {port}")
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
