@@ -286,10 +286,24 @@ def check_scores():
                         home_team.get("name", "HOME"),
                     )
 
+                    away_runs = away_team_data.get("score", 0) or 0
+                    home_runs = home_team_data.get("score", 0) or 0
+
+                    away_line = f"{away_ticker} {away_runs}"
+                    home_line = f"{home_ticker} {home_runs}"
+
+                    # Bold whichever side won. A tie leaves both plain.
+                    try:
+                        if int(away_runs) > int(home_runs):
+                            away_line = f"**{away_line}**"
+                        elif int(home_runs) > int(away_runs):
+                            home_line = f"**{home_line}**"
+                    except (TypeError, ValueError):
+                        pass
+
                     final_message = (
                         f"🏁 FINAL SCORE 🏁\n"
-                        f"{away_ticker} {away_team_data.get('score', 0)} @ "
-                        f"{home_ticker} {home_team_data.get('score', 0)}\n"
+                        f"{away_line} @ {home_line}\n"
                         f"The game has officially ended."
                     )
 
