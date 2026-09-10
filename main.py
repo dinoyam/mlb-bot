@@ -1,162 +1,422 @@
 import os
+import threading
 import time
 from datetime import datetime
-import pytz
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
+
 import requests
-from threading import Thread
-from http.server import SimpleHTTPRequestHandler, HTTPServer
 
-# ==============================================================================
-# 🌐 1. RENDER PORT HARNESS (KEEPS APP ALIVE 24/7 FOR FREE)
-# ==============================================================================
-def run_fake_server():
-    # Binds to port 10000 to completely satisfy Render's free web service check
-    server = HTTPServer(('0.0.0.0', 10000), SimpleHTTPRequestHandler)
-    print("🌐 Port 10000 securely bound. Render environment verified!")
-    server.serve_forever()
-
-# Launch the server thread immediately upon boot
-Thread(target=run_fake_server, daemon=True).start()
-
-# ==============================================================================
-# ⚾ 2. CORE LIVE TRACKING LOGIC (GLOBAL LEAGUE-WIDE SCANNER)
-# ==============================================================================
+# Set DISCORD_WEBHOOK_URL in Render: Dashboard > your service > Environment.
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-if not DISCORD_WEBHOOK_URL:
-    raise ValueError("CRITICAL ERROR: The DISCORD_WEBHOOK_URL environment variable is missing!")
 
-# Corrected production endpoints to ensure live feeds load successfully
-SCHEDULE_URL = "https://mlb.com{date}"
-GAME_FEED_URL = "https://mlb.com{game_pk}/feed/live"
+if not DISCORD_WEBHOOK_URL:
+    raise SystemExit(
+        "DISCORD_WEBHOOK_URL is not set. Add it under Environment in Render."
+    )
+
+SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
+GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 
 sent_alerts = set()
-sent_finals = set()
-game_scores = {}
+score_snapshots = {}
+game_statuses = {}
+final_alerts = set()
+seeded_games = set()
 
-print("⚾ League-Wide MLB Ticker is running live 24/7 on Render...")
 
-while True:
+def log(message):
+    # flush=True or Render buffers stdout and the log looks empty.
+    print(message, flush=True)
+
+
+def post_to_discord(content):
+    """Post to the webhook, backing off when Discord rate limits us."""
+    payload = {"content": content}
+
+    for attempt in range(3):
+        try:
+            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+
+            if response.status_code == 429:
+                retry_after = 1.0
+
+                try:
+                    retry_after = float(response.json().get("retry_after", 1))
+                except Exception:
+                    pass
+
+                log(f"Rate limited by Discord, waiting {retry_after}s")
+                time.sleep(min(retry_after, 30) + 0.25)
+                continue
+
+            response.raise_for_status()
+            time.sleep(0.5)  # webhooks allow ~30 messages/minute
+            return True
+
+        except Exception as post_error:
+            log(f"Discord post failed (attempt {attempt + 1}): {post_error}")
+            time.sleep(2)
+
+    return False
+
+
+def is_final_status(status):
+    return str(status or "").strip().lower() in {"final", "game over"}
+
+
+def get_run_label(play):
+    result = play.get("result", {})
+    rbi = result.get("rbi")
+
     try:
-        tz = pytz.timezone('America/New_York')
-        current_date = datetime.now(tz).strftime('%Y-%m-%d')
-        
-        # Pull the daily schedule data
-        schedule_response = requests.get(SCHEDULE_URL.format(date=current_date), timeout=10)
-        schedule_response.raise_for_status()
-        schedule_data = schedule_response.json()
-        
-        # Safely extract all games scheduled for today
-        games = []
-        for date_entry in schedule_data.get("dates", []):
-            games.extend(date_entry.get("games", []))
-            
-        for game in games:
-            try:
-                game_pk = str(game.get("gamePk"))
-                status = game.get("status", {}).get("abstractGameState")
-                
-                # Cache running scores silently on initial boot to prevent old play floods
-                if status == "Live" and game_pk not in game_scores:
-                    feed_response = requests.get(GAME_FEED_URL.format(game_pk=game_pk), timeout=10)
-                    if feed_response.status_code == 200:
-                        linescore = feed_response.json().get("liveData", {}).get("linescore", {})
-                        a_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
-                        h_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
-                        game_scores[game_pk] = f"{a_runs}-{h_runs}"
-                
-                # --- LIVE IN-GAME PROCESSING ---
-                if status == "Live":
-                    feed_response = requests.get(GAME_FEED_URL.format(game_pk=game_pk), timeout=10)
-                    feed_response.raise_for_status()
-                    feed = feed_response.json()
-                    
-                    all_plays = feed.get("liveData", {}).get("plays", {}).get("allPlays", [])
-                    linescore = feed.get("liveData", {}).get("linescore", {})
-                    
-                    away_team = feed.get("gameData", {}).get("teams", {}).get("away", {}).get("fileCode", "AWY").upper()
-                    home_team = feed.get("gameData", {}).get("teams", {}).get("home", {}).get("fileCode", "HOM").upper()
-                    away_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
-                    home_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
-                    
-                    current_score_key = f"{away_runs}-{home_runs}"
-                    
-                    is_top = linescore.get("isTopInning", True)
-                    arrow = "⬆️" if is_top else "⬇️"
-                    inning_num = linescore.get("currentInningOrdinal", "1st")
-                    inning_state = f"{arrow}{inning_num}"
-                    
-                    outs_num = feed.get("liveData", {}).get("plays", {}).get("currentPlay", {}).get("count", {}).get("outs", 0)
-                    out_dots = "○○○" if outs_num == 0 else "●○○" if outs_num == 1 else "●●○"
-                    
-                    # Scan every play sequentially to prevent dropped simultaneous alerts
-                    for play in all_plays:
-                        result = play.get("result", {})
-                        about = play.get("about", {})
-                        
-                        # Fingerprint each play using atBatIndex so it never misses multiple plays
-                        at_bat_idx = about.get("atBatIndex")
-                        if at_bat_idx is None:
-                            continue
-                            
-                        play_unique_id = f"{game_pk}_{at_bat_idx}"
-                        
-                        if play_unique_id not in sent_alerts:
-                            description = result.get("description", "")
-                            batter_name = play.get("matchup", {}).get("batter", {}).get("fullName", "Player")
-                            event_type = result.get("event", "")
-                            
-                            # Calculate scoring type (Solo / 2-Run / 3-Run / Grand Slam) directly from RBI counts
-                            rbi_count = result.get("rbi", 0)
-                            homer_prefix = "Solo" if rbi_count == 1 else f"{rbi_count}-Run" if rbi_count < 4 else "Grand Slam"
-                            
-                            # Rule A: Home Run alerts
-                            if event_type == "Home Run":
-                                payload = {
-                                    "content": f"⚾ **LIVE HOME RUN!** ⚾\n**{batter_name}** hits a {homer_prefix} home run!\n{description}\n{away_team} {away_runs} - {home_team} {home_runs} • {inning_state} {out_dots}"
-                                }
-                                discord_res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-                                discord_res.raise_for_status()
-                                sent_alerts.add(play_unique_id)
-                                game_scores[game_pk] = current_score_key
-                                
-                            # Rule B: Standard scoring play alerts
-                            elif about.get("isScoringPlay", False) and game_scores.get(game_pk) != current_score_key:
-                                payload = {
-                                    "content": f"⚾ **LIVE SCORE UPDATE** ⚾\n**{batter_name}** - {event_type}\n{description}\n{away_team} {away_runs} - {home_team} {home_runs} • {inning_state} {out_dots}"
-                                }
-                                discord_res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-                                discord_res.raise_for_status()
-                                sent_alerts.add(play_unique_id)
-                                game_scores[game_pk] = current_score_key
-                
-                # --- PATH B: GAME COMPLETED SUMMARY TRANSITION ---
-                elif (status == "Final" or status == "Game Over"):
-                    # Cache already-final games silently on script restart to prevent history flood spam
-                    if game_pk not in sent_finals and game_pk not in game_scores:
-                        sent_finals.add(game_pk)
-                        
-                    elif game_pk not in sent_finals:
-                        feed_response = requests.get(GAME_FEED_URL.format(game_pk=game_pk), timeout=10)
-                        feed_response.raise_for_status()
-                        feed = feed_response.json()
-                        
-                        linescore = feed.get("liveData", {}).get("linescore", {})
-                        away_team = feed.get("gameData", {}).get("teams", {}).get("away", {}).get("fileCode", "AWY").upper()
-                        home_team = feed.get("gameData", {}).get("teams", {}).get("home", {}).get("fileCode", "HOM").upper()
-                        away_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
-                        home_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
-                        
-                        payload = {
-                            "content": f"🏁 **FINAL SCORE** 🏁\n{away_team} {away_runs} @ {home_team} {home_runs}\nThe game has officially ended."
-                        }
-                        discord_res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-                        discord_res.raise_for_status()
-                        sent_finals.add(game_pk)
-                        
-            except Exception as inner_error:
-                print(f"Skipping game check for game ID {game.get('gamePk')} due to database lag: {inner_error}")
+        rbi = int(rbi)
+    except (TypeError, ValueError):
+        scoring_runners = 0
+        for runner in play.get("runners", []):
+            details = runner.get("details") or {}
+            movement = runner.get("movement") or {}
+            if details.get("isScoringEvent") or movement.get("end") == "score":
+                scoring_runners += 1
+        rbi = scoring_runners or 1
 
-    except Exception as e:
-        print(f"Global scheduling loop lookups encountered an API block: {e}")
-        
-    time.sleep(15)
+    return {
+        1: "Solo",
+        2: "2-Run",
+        3: "3-Run",
+        4: "Grand Slam",
+    }.get(rbi, f"{rbi}-Run")
+
+
+def get_batter_name(feed, matchup, fallback="Unknown Player"):
+    batter = matchup.get("batter", {})
+    batter_id = batter.get("id")
+
+    # People live under gameData, not liveData.
+    people = feed.get("gameData", {}).get("players", {})
+    batter_profile = people.get(f"ID{batter_id}", {})
+
+    return batter.get("fullName") or batter_profile.get("fullName", fallback)
+
+
+def get_home_run_message(feed, play):
+    matchup = play.get("matchup", {})
+    batter_name = get_batter_name(feed, matchup)
+
+    result = play.get("result", {})
+    run_label = f"{get_run_label(play)} Homer"
+    raw_description = result.get("description", "Home run")
+
+    linescore = feed.get("liveData", {}).get("linescore", {})
+    linescore_teams = linescore.get("teams", {})
+    away_score = linescore_teams.get("away", {}).get("runs", 0)
+    home_score = linescore_teams.get("home", {}).get("runs", 0)
+
+    game_teams = feed.get("gameData", {}).get("teams", {})
+    away_team = game_teams.get("away", {})
+    home_team = game_teams.get("home", {})
+    away_ticker = away_team.get("abbreviation", away_team.get("name", "AWAY"))
+    home_ticker = home_team.get("abbreviation", home_team.get("name", "HOME"))
+
+    return (
+        f"⚾ LIVE HOME RUN! ⚾\n"
+        f"**{batter_name}** - {run_label}\n"
+        f"{raw_description}\n"
+        f"{away_ticker} {away_score} - {home_ticker} {home_score} • "
+        f"{get_inning_indicator(linescore)} {get_out_dots(play)}"
+    )
+
+
+def get_scoring_runner_count(play):
+    count = 0
+
+    for runner in play.get("runners", []):
+        details = runner.get("details") or {}
+        movement = runner.get("movement") or {}
+
+        if details.get("isScoringEvent") or movement.get("end") == "score":
+            count += 1
+
+    return count
+
+
+def get_play_rbi_count(play):
+    rbi = play.get("result", {}).get("rbi")
+
+    try:
+        return int(rbi)
+    except (TypeError, ValueError):
+        return get_scoring_runner_count(play)
+
+
+def get_latest_scoring_play(all_plays):
+    for play in reversed(all_plays):
+        if (
+            play.get("result", {}).get("event") == "Home Run"
+            or get_play_rbi_count(play) > 0
+            or get_scoring_runner_count(play) > 0
+        ):
+            return play
+
+    return {}
+
+
+def get_inning_indicator(linescore):
+    inning_number = linescore.get("currentInning")
+    inning_ordinal = linescore.get("currentInningOrdinal")
+
+    if inning_ordinal:
+        ordinal = inning_ordinal
+    elif isinstance(inning_number, int):
+        suffix = "th"
+
+        if inning_number % 100 not in (11, 12, 13):
+            suffix = {
+                1: "st",
+                2: "nd",
+                3: "rd",
+            }.get(inning_number % 10, "th")
+
+        ordinal = f"{inning_number}{suffix}"
+    else:
+        ordinal = str(inning_number or "?")
+
+    inning_state = str(linescore.get("inningState", "")).lower()
+
+    if inning_state == "top":
+        arrow = "⬆️"
+    elif inning_state == "bottom":
+        arrow = "⬇️"
+    else:
+        arrow = "•"
+
+    return f"{arrow}{ordinal}"
+
+
+def get_out_dots(play):
+    outs = play.get("count", {}).get("outs", 0)
+
+    try:
+        outs = max(0, min(int(outs), 2))
+    except (TypeError, ValueError):
+        outs = 0
+
+    return "●" * outs + "○" * (3 - outs)
+
+
+def get_score_update_message(feed, all_plays, away_score, home_score, linescore):
+    scoring_play = get_latest_scoring_play(all_plays)
+    result = scoring_play.get("result", {})
+    matchup = scoring_play.get("matchup", {})
+    batter_name = get_batter_name(feed, matchup, fallback="Unknown Batter")
+
+    rbi_count = get_play_rbi_count(scoring_play)
+    event_type = result.get("event", "Scoring Play")
+
+    if rbi_count > 1:
+        rbi_event_type = f"{rbi_count}-RBI {event_type}"
+    elif rbi_count == 1:
+        rbi_event_type = f"RBI {event_type}"
+    else:
+        rbi_event_type = event_type
+
+    raw_description = result.get("description", "Scoring play")
+
+    game_teams = feed.get("gameData", {}).get("teams", {})
+    away_team = game_teams.get("away", {})
+    home_team = game_teams.get("home", {})
+    away_ticker = away_team.get("abbreviation", away_team.get("name", "AWAY"))
+    home_ticker = home_team.get("abbreviation", home_team.get("name", "HOME"))
+
+    return (
+        f"⚾ LIVE SCORE UPDATE ⚾\n"
+        f"**{batter_name}** - {rbi_event_type}\n"
+        f"{raw_description}\n"
+        f"{away_ticker} {away_score} - {home_ticker} {home_score} • "
+        f"{get_inning_indicator(linescore)} {get_out_dots(scoring_play)}"
+    )
+
+
+def check_scores():
+    """One full pass over today's schedule."""
+    date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    schedule_data = requests.get(
+        SCHEDULE_URL.format(date=date),
+        timeout=10,
+    ).json()
+
+    games = [
+        game
+        for schedule_date in schedule_data.get("dates", [])
+        for game in schedule_date.get("games", [])
+    ]
+
+    # Process every game independently so one bad game feed cannot stop
+    # the remaining games from being checked.
+    for game in games:
+        status_data = game.get("status", {})
+        status = status_data.get("abstractGameState")
+        detailed_status = status_data.get("detailedState")
+        game_pk = game.get("gamePk")
+        previous_status = game_statuses.get(game_pk)
+
+        # Handle a transition to Final or Game Over once per game.
+        if is_final_status(status) or is_final_status(detailed_status):
+            try:
+                game_statuses[game_pk] = status or detailed_status
+
+                if (
+                    previous_status is not None
+                    and not is_final_status(previous_status)
+                    and game_pk not in final_alerts
+                ):
+                    game_teams = game.get("teams", {})
+                    away_team_data = game_teams.get("away", {})
+                    home_team_data = game_teams.get("home", {})
+                    away_team = away_team_data.get("team", {})
+                    home_team = home_team_data.get("team", {})
+
+                    away_ticker = away_team.get(
+                        "abbreviation",
+                        away_team.get("name", "AWAY"),
+                    )
+                    home_ticker = home_team.get(
+                        "abbreviation",
+                        home_team.get("name", "HOME"),
+                    )
+
+                    final_message = (
+                        f"🏁 FINAL SCORE 🏁\n"
+                        f"{away_ticker} {away_team_data.get('score', 0)} @ "
+                        f"{home_ticker} {home_team_data.get('score', 0)}\n"
+                        f"The game has officially ended."
+                    )
+
+                    if post_to_discord(final_message):
+                        final_alerts.add(game_pk)
+
+            except Exception as game_error:
+                log(f"Error processing final game {game_pk}: {game_error}")
+
+            continue
+
+        game_statuses[game_pk] = status or detailed_status
+
+        # Only process live, ongoing games.
+        if status != "Live":
+            continue
+
+        try:
+            feed = requests.get(
+                GAME_FEED_URL.format(game_pk=game_pk),
+                timeout=10,
+            ).json()
+
+            all_plays = feed.get("liveData", {}).get("plays", {}).get(
+                "allPlays",
+                [],
+            )
+
+            # First time we see this game (including after a restart) we only
+            # record what has already happened instead of alerting on it.
+            is_first_look = game_pk not in seeded_games
+
+            # Track score changes independently from home-run alerts.
+            live_data = feed.get("liveData", {})
+            linescore = live_data.get("linescore", {})
+            linescore_teams = linescore.get("teams", {})
+            away_linescore = linescore_teams.get("away", {})
+            home_linescore = linescore_teams.get("home", {})
+
+            away_score = away_linescore.get("runs", 0)
+            home_score = home_linescore.get("runs", 0)
+            current_scores = (away_score, home_score)
+            previous_scores = score_snapshots.get(game_pk)
+
+            latest_scoring_play = get_latest_scoring_play(all_plays)
+            latest_event = latest_scoring_play.get("result", {}).get("event")
+
+            # A home run gets only the home-run alert, not a generic
+            # score-update alert.
+            if (
+                previous_scores is not None
+                and current_scores != previous_scores
+                and latest_event != "Home Run"
+            ):
+                post_to_discord(
+                    get_score_update_message(
+                        feed,
+                        all_plays,
+                        away_score,
+                        home_score,
+                        linescore,
+                    )
+                )
+
+            score_snapshots[game_pk] = current_scores
+
+            # Check every play, newest first, for unreported home runs.
+            for play in reversed(all_plays):
+                result = play.get("result", {})
+                about = play.get("about", {})
+
+                if result.get("event") != "Home Run":
+                    continue
+
+                play_key = about.get("playId") or about.get("atBatIndex")
+                play_id = f"{game_pk}_{play_key}"
+
+                if play_id in sent_alerts:
+                    continue
+
+                if is_first_look:
+                    # Already happened before we started watching.
+                    sent_alerts.add(play_id)
+                    continue
+
+                if post_to_discord(get_home_run_message(feed, play)):
+                    sent_alerts.add(play_id)
+
+            seeded_games.add(game_pk)
+
+        except Exception as game_error:
+            log(f"Error processing game {game_pk}: {game_error}")
+            continue
+
+
+def run_bot():
+    log("⚾ Home Run Bot is running live...")
+
+    while True:
+        try:
+            check_scores()
+        except Exception as error:
+            log(f"Error checking scores: {error}")
+
+        time.sleep(15)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Render web services require an open port or the deploy is killed."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"MLB alert bot is running")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass  # keep Render logs readable
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    port = int(os.environ.get("PORT", 10000))
+    log(f"Health server listening on port {port}")
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
