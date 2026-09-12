@@ -1,7 +1,7 @@
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
@@ -15,7 +15,10 @@ if not DISCORD_WEBHOOK_URL:
         "DISCORD_WEBHOOK_URL is not set. Add it under Environment in Render."
     )
 
-SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
+SCHEDULE_URL = (
+    "https://statsapi.mlb.com/api/v1/schedule"
+    "?sportId=1&startDate={start_date}&endDate={end_date}"
+)
 GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 
 sent_alerts = set()
@@ -245,18 +248,32 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
 
 def check_scores():
     """One full pass over today's schedule."""
-    date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    now = datetime.now(ZoneInfo("America/New_York"))
+
+    # Ask for yesterday and today together. A game that starts at 10pm ET
+    # belongs to yesterday's schedule but is still being played after
+    # midnight, and querying only "today" would lose it mid-game.
+    start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
 
     schedule_data = requests.get(
-        SCHEDULE_URL.format(date=date),
+        SCHEDULE_URL.format(start_date=start_date, end_date=end_date),
         timeout=10,
     ).json()
 
-    games = [
-        game
-        for schedule_date in schedule_data.get("dates", [])
-        for game in schedule_date.get("games", [])
-    ]
+    # The same game can only appear once, but dedupe by gamePk to be safe.
+    games = []
+    seen_pks = set()
+
+    for schedule_date in schedule_data.get("dates", []):
+        for game in schedule_date.get("games", []):
+            game_pk = game.get("gamePk")
+
+            if game_pk in seen_pks:
+                continue
+
+            seen_pks.add(game_pk)
+            games.append(game)
 
     # Process every game independently so one bad game feed cannot stop
     # the remaining games from being checked.
