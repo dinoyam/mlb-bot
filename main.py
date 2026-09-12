@@ -24,6 +24,12 @@ game_statuses = {}
 final_alerts = set()
 seeded_games = set()
 
+# Health tracking, surfaced on the status page.
+last_cycle_at = None
+cycle_count = 0
+last_error = None
+bot_thread = None
+
 
 def log(message):
     # flush=True or Render buffers stdout and the log looks empty.
@@ -400,18 +406,68 @@ def check_scores():
 
 
 def run_bot():
+    global last_cycle_at, cycle_count, last_error
+
     log("⚾ Home Run Bot is running live...")
 
     while True:
         try:
             check_scores()
+            last_cycle_at = time.time()
+            cycle_count += 1
+
+            # A heartbeat every ~5 minutes so the Render log shows life
+            # without drowning in noise.
+            if cycle_count % 20 == 0:
+                log(f"Heartbeat: {cycle_count} cycles, watching {len(seeded_games)} games")
+
         except Exception as error:
+            last_error = f"{datetime.now(ZoneInfo('America/New_York')):%H:%M:%S} - {error}"
             log(f"Error checking scores: {error}")
 
         time.sleep(15)
 
 
-BODY = b"MLB alert bot is running"
+def watchdog():
+    """Restart the bot loop if its thread ever dies."""
+    global bot_thread
+
+    while True:
+        time.sleep(30)
+
+        if bot_thread is None or not bot_thread.is_alive():
+            log("Bot thread died. Restarting it.")
+            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread.start()
+            continue
+
+        # Thread alive but not completing cycles means it is wedged,
+        # usually on a request that never returns.
+        if last_cycle_at and time.time() - last_cycle_at > 300:
+            log("Bot loop has not completed a cycle in 5 minutes.")
+
+
+def build_status():
+    if last_cycle_at:
+        seconds_ago = int(time.time() - last_cycle_at)
+        last_seen = f"{seconds_ago}s ago"
+    else:
+        last_seen = "never"
+
+    alive = bot_thread is not None and bot_thread.is_alive()
+
+    lines = [
+        "MLB alert bot is running",
+        "",
+        f"bot loop alive: {alive}",
+        f"last successful check: {last_seen}",
+        f"total checks: {cycle_count}",
+        f"games being tracked: {len(seeded_games)}",
+        f"alerts sent this run: {len(sent_alerts)}",
+        f"last error: {last_error or 'none'}",
+    ]
+
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -419,26 +475,30 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def _send_headers(self):
+    def _send_headers(self, length):
         # Content-Length is required, or proxies treat the reply as invalid.
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(BODY)))
+        self.send_header("Content-Length", str(length))
         self.end_headers()
 
     def do_GET(self):
-        self._send_headers()
-        self.wfile.write(BODY)
+        body = build_status()
+        self._send_headers(len(body))
+        self.wfile.write(body)
 
     def do_HEAD(self):
-        self._send_headers()
+        self._send_headers(len(build_status()))
 
     def log_message(self, *args):
         pass  # keep Render logs readable
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    threading.Thread(target=watchdog, daemon=True).start()
 
     port = int(os.environ.get("PORT", 10000))
     log(f"Health server listening on port {port}")
