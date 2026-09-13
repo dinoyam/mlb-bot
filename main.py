@@ -1,7 +1,7 @@
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,11 @@ SCHEDULE_URL = (
 )
 GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 
+# Embed sidebar colors.
+HOME_RUN_COLOR = 0xE8A33D   # amber
+SCORE_COLOR = 0x4B8BF5      # blue
+FINAL_COLOR = 0x8A8F98      # gray
+
 sent_alerts = set()
 score_snapshots = {}
 game_statuses = {}
@@ -39,9 +44,10 @@ def log(message):
     print(message, flush=True)
 
 
-def post_to_discord(content):
+def post_to_discord(payload):
     """Post to the webhook, backing off when Discord rate limits us."""
-    payload = {"content": content}
+    if isinstance(payload, str):
+        payload = {"content": payload}
 
     for attempt in range(3):
         try:
@@ -108,6 +114,26 @@ def get_batter_name(feed, matchup, fallback="Unknown Player"):
     return batter.get("fullName") or batter_profile.get("fullName", fallback)
 
 
+def build_embed(color, header, title, description, score_line, inning, outs):
+    """Shared embed shape so every alert type looks the same."""
+    return {
+        "embeds": [
+            {
+                "color": color,
+                "author": {"name": header},
+                "title": title,
+                "description": description,
+                "fields": [
+                    {"name": "Score", "value": score_line, "inline": True},
+                    {"name": "Inning", "value": inning, "inline": True},
+                    {"name": "Outs", "value": outs, "inline": True},
+                ],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+    }
+
+
 def get_home_run_message(feed, play):
     matchup = play.get("matchup", {})
     batter_name = get_batter_name(feed, matchup)
@@ -127,12 +153,14 @@ def get_home_run_message(feed, play):
     away_ticker = away_team.get("abbreviation", away_team.get("name", "AWAY"))
     home_ticker = home_team.get("abbreviation", home_team.get("name", "HOME"))
 
-    return (
-        f"⚾ LIVE HOME RUN! ⚾\n"
-        f"**{batter_name}** - {run_label}\n"
-        f"{raw_description}\n"
-        f"{away_ticker} {away_score} - {home_ticker} {home_score} • "
-        f"{get_inning_indicator(linescore)} {get_out_dots(play)}"
+    return build_embed(
+        color=HOME_RUN_COLOR,
+        header="⚾ HOME RUN",
+        title=f"{batter_name} — {run_label}",
+        description=raw_description,
+        score_line=f"{away_ticker} {away_score} · {home_ticker} {home_score}",
+        inning=get_inning_indicator(linescore),
+        outs=get_out_dots(play),
     )
 
 
@@ -237,12 +265,14 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
     away_ticker = away_team.get("abbreviation", away_team.get("name", "AWAY"))
     home_ticker = home_team.get("abbreviation", home_team.get("name", "HOME"))
 
-    return (
-        f"⚾ LIVE SCORE UPDATE ⚾\n"
-        f"**{batter_name}** - {rbi_event_type}\n"
-        f"{raw_description}\n"
-        f"{away_ticker} {away_score} - {home_ticker} {home_score} • "
-        f"{get_inning_indicator(linescore)} {get_out_dots(scoring_play)}"
+    return build_embed(
+        color=SCORE_COLOR,
+        header="⚾ SCORE UPDATE",
+        title=f"{batter_name} — {rbi_event_type}",
+        description=raw_description,
+        score_line=f"{away_ticker} {away_score} · {home_ticker} {home_score}",
+        inning=get_inning_indicator(linescore),
+        outs=get_out_dots(scoring_play),
     )
 
 
@@ -324,11 +354,18 @@ def check_scores():
                     except (TypeError, ValueError):
                         pass
 
-                    final_message = (
-                        f"🏁 FINAL SCORE 🏁\n"
-                        f"{away_line} @ {home_line}\n"
-                        f"The game has officially ended."
-                    )
+                    final_message = {
+                        "embeds": [
+                            {
+                                "color": FINAL_COLOR,
+                                "author": {"name": "🏁 FINAL"},
+                                "title": f"{away_line}  @  {home_line}",
+                                "timestamp": datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
+                            }
+                        ]
+                    }
 
                     if post_to_discord(final_message):
                         final_alerts.add(game_pk)
@@ -464,27 +501,81 @@ def watchdog():
             log("Bot loop has not completed a cycle in 5 minutes.")
 
 
+STATUS_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>MLB Alert Bot</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex;
+    align-items: center; justify-content: center;
+    background: #16181c; color: #e6e8eb;
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 24px;
+  }}
+  .card {{
+    width: 100%; max-width: 420px;
+    background: #1e2126; border: 1px solid #2c3038;
+    border-radius: 12px; padding: 24px 26px;
+  }}
+  h1 {{
+    margin: 0 0 20px; font-size: 15px; font-weight: 600;
+    letter-spacing: .04em; text-transform: uppercase; color: #f0f2f4;
+    display: flex; align-items: center; gap: 10px;
+  }}
+  .dot {{
+    width: 9px; height: 9px; border-radius: 50%;
+    background: {dot}; box-shadow: 0 0 8px {dot};
+  }}
+  .row {{
+    display: flex; justify-content: space-between;
+    gap: 16px; padding: 9px 0; border-top: 1px solid #262a31;
+  }}
+  .row:first-of-type {{ border-top: 0; }}
+  .k {{ color: #878e99; }}
+  .v {{ color: #f0f2f4; text-align: right; word-break: break-word; }}
+  .err {{ color: #e5807a; }}
+  footer {{ margin-top: 18px; font-size: 12px; color: #6b727d; }}
+</style></head>
+<body><div class="card">
+  <h1><span class="dot"></span>MLB Alert Bot</h1>
+  <div class="row"><span class="k">bot loop</span><span class="v">{alive}</span></div>
+  <div class="row"><span class="k">last check</span><span class="v">{last_seen}</span></div>
+  <div class="row"><span class="k">total checks</span><span class="v">{cycles}</span></div>
+  <div class="row"><span class="k">games seen</span><span class="v">{games}</span></div>
+  <div class="row"><span class="k">alerts sent</span><span class="v">{alerts}</span></div>
+  <div class="row"><span class="k">last error</span><span class="v {err_class}">{error}</span></div>
+  <footer>refreshes every 15s</footer>
+</div></body></html>
+"""
+
+
 def build_status():
     if last_cycle_at:
         seconds_ago = int(time.time() - last_cycle_at)
         last_seen = f"{seconds_ago}s ago"
+        healthy = seconds_ago < 60
     else:
         last_seen = "never"
+        healthy = False
 
     alive = bot_thread is not None and bot_thread.is_alive()
+    healthy = healthy and alive
 
-    lines = [
-        "MLB alert bot is running",
-        "",
-        f"bot loop alive: {alive}",
-        f"last successful check: {last_seen}",
-        f"total checks: {cycle_count}",
-        f"games being tracked: {len(seeded_games)}",
-        f"alerts sent this run: {len(sent_alerts)}",
-        f"last error: {last_error or 'none'}",
-    ]
+    html = STATUS_TEMPLATE.format(
+        dot="#57c07d" if healthy else "#e5807a",
+        alive="running" if alive else "STOPPED",
+        last_seen=last_seen,
+        cycles=cycle_count,
+        games=len(seeded_games),
+        alerts=len(sent_alerts),
+        error=last_error or "none",
+        err_class="err" if last_error else "",
+    )
 
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    return html.encode("utf-8")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -495,7 +586,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def _send_headers(self, length):
         # Content-Length is required, or proxies treat the reply as invalid.
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(length))
         self.end_headers()
 
