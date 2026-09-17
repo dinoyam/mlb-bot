@@ -38,6 +38,13 @@ cycle_count = 0
 last_error = None
 bot_thread = None
 
+# Discord delivery tracking.
+posts_ok = 0
+posts_failed = 0
+last_post_at = None
+last_post_error = None
+live_now = 0
+
 
 def log(message):
     # flush=True or Render buffers stdout and the log looks empty.
@@ -46,6 +53,8 @@ def log(message):
 
 def post_to_discord(payload):
     """Post to the webhook, backing off when Discord rate limits us."""
+    global posts_ok, posts_failed, last_post_at, last_post_error
+
     if isinstance(payload, str):
         payload = {"content": payload}
 
@@ -67,12 +76,28 @@ def post_to_discord(payload):
 
             response.raise_for_status()
             time.sleep(0.5)  # webhooks allow ~30 messages/minute
+
+            posts_ok += 1
+            last_post_at = time.time()
             return True
 
         except Exception as post_error:
-            log(f"Discord post failed (attempt {attempt + 1}): {post_error}")
+            detail = str(post_error)
+
+            # Discord explains rejections in the body; the status code alone
+            # does not say which field it disliked.
+            try:
+                detail = f"{detail} | {response.text[:200]}"
+            except Exception:
+                pass
+
+            log(f"Discord post failed (attempt {attempt + 1}): {detail}")
+            last_post_error = (
+                f"{datetime.now(ZoneInfo('America/New_York')):%H:%M:%S} - {detail}"
+            )
             time.sleep(2)
 
+    posts_failed += 1
     return False
 
 
@@ -277,6 +302,9 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
 
 
 def check_scores():
+    global live_now
+
+    live_count = 0
     """One full pass over today's schedule."""
     now = datetime.now(ZoneInfo("America/New_York"))
 
@@ -381,6 +409,8 @@ def check_scores():
         if status != "Live":
             continue
 
+        live_count += 1
+
         try:
             feed = requests.get(
                 GAME_FEED_URL.format(game_pk=game_pk),
@@ -457,6 +487,8 @@ def check_scores():
         except Exception as game_error:
             log(f"Error processing game {game_pk}: {game_error}")
             continue
+
+    live_now = live_count
 
 
 def run_bot():
@@ -543,13 +575,33 @@ STATUS_TEMPLATE = """<!doctype html>
   <h1><span class="dot"></span>MLB Alert Bot</h1>
   <div class="row"><span class="k">bot loop</span><span class="v">{alive}</span></div>
   <div class="row"><span class="k">last check</span><span class="v">{last_seen}</span></div>
+  <div class="row"><span class="k">live games now</span><span class="v">{live}</span></div>
   <div class="row"><span class="k">total checks</span><span class="v">{cycles}</span></div>
   <div class="row"><span class="k">games seen</span><span class="v">{games}</span></div>
-  <div class="row"><span class="k">alerts sent</span><span class="v">{alerts}</span></div>
-  <div class="row"><span class="k">last error</span><span class="v {err_class}">{error}</span></div>
+  <div class="row"><span class="k">posts sent ok</span><span class="v">{posts_ok}</span></div>
+  <div class="row"><span class="k">posts failed</span><span class="v {fail_class}">{posts_failed}</span></div>
+  <div class="row"><span class="k">last post</span><span class="v">{last_post}</span></div>
+  <div class="row"><span class="k">last post error</span><span class="v {post_err_class}">{post_error}</span></div>
+  <div class="row"><span class="k">last loop error</span><span class="v {err_class}">{error}</span></div>
   <footer>refreshes every 15s</footer>
 </div></body></html>
 """
+
+
+def humanize_age(stamp):
+    if not stamp:
+        return "never"
+
+    seconds = int(time.time() - stamp)
+
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+
+    return f"{seconds // 86400}d ago"
 
 
 def build_status():
@@ -568,9 +620,15 @@ def build_status():
         dot="#57c07d" if healthy else "#e5807a",
         alive="running" if alive else "STOPPED",
         last_seen=last_seen,
+        live=live_now,
         cycles=cycle_count,
         games=len(seeded_games),
-        alerts=len(sent_alerts),
+        posts_ok=posts_ok,
+        posts_failed=posts_failed,
+        fail_class="err" if posts_failed else "",
+        last_post=humanize_age(last_post_at),
+        post_error=last_post_error or "none",
+        post_err_class="err" if last_post_error else "",
         error=last_error or "none",
         err_class="err" if last_error else "",
     )
