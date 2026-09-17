@@ -436,7 +436,9 @@ def check_scores():
         game_statuses[game_pk] = status or detailed_status
 
         # Only process live, ongoing games.
-        if status != "Live":
+        # MLB files Warmup and Pre-Game under the "Live" umbrella. No plays
+        # exist yet, so skip them or the live count reads high.
+        if status != "Live" or detailed_status in {"Warmup", "Pre-Game"}:
             continue
 
         live_count += 1
