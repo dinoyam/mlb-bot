@@ -58,20 +58,32 @@ def post_to_discord(payload):
     if isinstance(payload, str):
         payload = {"content": payload}
 
-    for attempt in range(3):
+    for attempt in range(5):
+        response = None
+
         try:
             response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
 
             if response.status_code == 429:
                 retry_after = 1.0
+                scope = response.headers.get("X-RateLimit-Scope", "?")
 
                 try:
                     retry_after = float(response.json().get("retry_after", 1))
                 except Exception:
-                    pass
+                    # Cloudflare returns an HTML page, not Discord's JSON.
+                    retry_after = float(response.headers.get("Retry-After", 60))
 
-                log(f"Rate limited by Discord, waiting {retry_after}s")
-                time.sleep(min(retry_after, 30) + 0.25)
+                last_post_error = (
+                    f"{datetime.now(ZoneInfo('America/New_York')):%H:%M:%S} - "
+                    f"429 scope={scope} retry_after={retry_after:.0f}s "
+                    f"body={response.text[:120]}"
+                )
+                log(f"Rate limited: {last_post_error}")
+
+                # Honor what Discord asks for, capped so one long ban does
+                # not wedge the loop for an hour.
+                time.sleep(min(retry_after, 120) + 0.5)
                 continue
 
             response.raise_for_status()
@@ -86,10 +98,8 @@ def post_to_discord(payload):
 
             # Discord explains rejections in the body; the status code alone
             # does not say which field it disliked.
-            try:
+            if response is not None:
                 detail = f"{detail} | {response.text[:200]}"
-            except Exception:
-                pass
 
             log(f"Discord post failed (attempt {attempt + 1}): {detail}")
             last_post_error = (
