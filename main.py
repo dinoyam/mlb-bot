@@ -41,9 +41,14 @@ bot_thread = None
 # Discord delivery tracking.
 posts_ok = 0
 posts_failed = 0
+posts_skipped = 0
 last_post_at = None
 last_post_error = None
+blocked_until = 0
 live_now = 0
+
+# How long to stay quiet after Discord IP-blocks us.
+BLOCK_COOLDOWN = 900
 
 
 def log(message):
@@ -53,10 +58,17 @@ def log(message):
 
 def post_to_discord(payload):
     """Post to the webhook, backing off when Discord rate limits us."""
-    global posts_ok, posts_failed, last_post_at, last_post_error
+    global posts_ok, posts_failed, posts_skipped
+    global last_post_at, last_post_error, blocked_until
 
     if isinstance(payload, str):
         payload = {"content": payload}
+
+    # Discord has IP-blocked us. Sending more requests only extends the
+    # block, so drop the message rather than queue a flood for later.
+    if time.time() < blocked_until:
+        posts_skipped += 1
+        return True
 
     for attempt in range(5):
         response = None
@@ -67,22 +79,30 @@ def post_to_discord(payload):
             if response.status_code == 429:
                 retry_after = 1.0
                 scope = response.headers.get("X-RateLimit-Scope", "?")
+                body = response.text[:160]
 
                 try:
                     retry_after = float(response.json().get("retry_after", 1))
                 except Exception:
-                    # Cloudflare returns an HTML page, not Discord's JSON.
                     retry_after = float(response.headers.get("Retry-After", 60))
 
                 last_post_error = (
                     f"{datetime.now(ZoneInfo('America/New_York')):%H:%M:%S} - "
-                    f"429 scope={scope} retry_after={retry_after:.0f}s "
-                    f"body={response.text[:120]}"
+                    f"429 scope={scope} retry_after={retry_after:.0f}s body={body}"
                 )
-                log(f"Rate limited: {last_post_error}")
 
-                # Honor what Discord asks for, capped so one long ban does
-                # not wedge the loop for an hour.
+                # A global IP block is not our webhook's quota. Retrying
+                # makes it last longer, so stop entirely for a while.
+                if "blocked from accessing" in body or '"code": 0' in body or '"code":0' in body:
+                    blocked_until = time.time() + BLOCK_COOLDOWN
+                    posts_failed += 1
+                    log(
+                        f"Discord IP block. Pausing posts for "
+                        f"{BLOCK_COOLDOWN // 60} minutes."
+                    )
+                    return False
+
+                log(f"Rate limited: {last_post_error}")
                 time.sleep(min(retry_after, 120) + 0.5)
                 continue
 
@@ -590,6 +610,8 @@ STATUS_TEMPLATE = """<!doctype html>
   <div class="row"><span class="k">games seen</span><span class="v">{games}</span></div>
   <div class="row"><span class="k">posts sent ok</span><span class="v">{posts_ok}</span></div>
   <div class="row"><span class="k">posts failed</span><span class="v {fail_class}">{posts_failed}</span></div>
+  <div class="row"><span class="k">dropped while blocked</span><span class="v">{posts_skipped}</span></div>
+  <div class="row"><span class="k">discord block</span><span class="v {block_class}">{block_state}</span></div>
   <div class="row"><span class="k">last post</span><span class="v">{last_post}</span></div>
   <div class="row"><span class="k">last post error</span><span class="v {post_err_class}">{post_error}</span></div>
   <div class="row"><span class="k">last loop error</span><span class="v {err_class}">{error}</span></div>
@@ -626,6 +648,13 @@ def build_status():
     alive = bot_thread is not None and bot_thread.is_alive()
     healthy = healthy and alive
 
+    remaining = int(blocked_until - time.time())
+
+    if remaining > 0:
+        block_state = f"clears in {remaining // 60}m {remaining % 60}s"
+    else:
+        block_state = "clear"
+
     html = STATUS_TEMPLATE.format(
         dot="#57c07d" if healthy else "#e5807a",
         alive="running" if alive else "STOPPED",
@@ -636,6 +665,9 @@ def build_status():
         posts_ok=posts_ok,
         posts_failed=posts_failed,
         fail_class="err" if posts_failed else "",
+        posts_skipped=posts_skipped,
+        block_state=block_state,
+        block_class="err" if remaining > 0 else "",
         last_post=humanize_age(last_post_at),
         post_error=last_post_error or "none",
         post_err_class="err" if last_post_error else "",
