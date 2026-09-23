@@ -51,6 +51,10 @@ game_lines = []
 # How long to stay quiet after Discord IP-blocks us.
 BLOCK_COOLDOWN = 900
 
+# Days of schedule to request. Covers late games past midnight and
+# postponed or resumed games still filed under an earlier date.
+LOOKBACK_DAYS = 4
+
 
 def log(message):
     # flush=True or Render buffers stdout and the log looks empty.
@@ -340,10 +344,11 @@ def check_scores():
     """One full pass over today's schedule."""
     now = datetime.now(ZoneInfo("America/New_York"))
 
-    # Ask for yesterday and today together. A game that starts at 10pm ET
-    # belongs to yesterday's schedule but is still being played after
-    # midnight, and querying only "today" would lose it mid-game.
-    start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Ask for a few days back, not just today. Two reasons: a game that
+    # starts at 10pm ET is still being played after midnight, and a
+    # postponed or suspended game is often still filed under its ORIGINAL
+    # date even when it is actually played days later.
+    start_date = (now - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
 
     schedule_data = requests.get(
