@@ -51,6 +51,19 @@ game_lines = []
 sched_total = 0
 sched_range = ""
 
+# Games MLB's schedule endpoint omits (seen with split doubleheaders).
+# Found by probing IDs next to a known split game, and kept for the day.
+discovered_pks = set()
+probed_pks = set()
+probe_day = None
+
+# Manual escape hatch: set EXTRA_GAME_PKS="824785,824786" in Render.
+EXTRA_GAME_PKS = {
+    int(pk.strip())
+    for pk in os.environ.get("EXTRA_GAME_PKS", "").split(",")
+    if pk.strip().isdigit()
+}
+
 # How long to stay quiet after Discord IP-blocks us.
 BLOCK_COOLDOWN = 900
 
@@ -339,12 +352,110 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
     )
 
 
+def schedule_entry_from_feed(game_pk):
+    """Ask the game feed directly about one ID and shape it like a
+    schedule entry, so a game missing from the schedule can still be
+    tracked by the normal loop."""
+    try:
+        feed = requests.get(
+            GAME_FEED_URL.format(game_pk=game_pk),
+            timeout=10,
+        ).json()
+    except Exception:
+        return None
+
+    game_data = feed.get("gameData", {})
+    status = game_data.get("status", {})
+
+    if not status:
+        return None
+
+    teams = game_data.get("teams", {})
+    linescore_teams = (
+        feed.get("liveData", {}).get("linescore", {}).get("teams", {})
+    )
+
+    def side(name):
+        return {
+            "team": {
+                "abbreviation": teams.get(name, {}).get("abbreviation"),
+                "name": teams.get(name, {}).get("name", "?"),
+            },
+            "score": linescore_teams.get(name, {}).get("runs", 0),
+        }
+
+    return {
+        "gamePk": game_pk,
+        "gameDate": game_data.get("datetime", {}).get("dateTime", ""),
+        "gameNumber": game_data.get("game", {}).get("gameNumber", "?"),
+        "doubleHeader": game_data.get("game", {}).get("doubleHeader", "?"),
+        "status": {
+            "abstractGameState": status.get("abstractGameState"),
+            "detailedState": status.get("detailedState"),
+        },
+        "teams": {"away": side("away"), "home": side("home")},
+    }
+
+
+def find_missing_doubleheader_games(games, seen_pks, today):
+    """MLB's schedule has been seen to return only one game of a split
+    doubleheader. The twin sits at an adjacent ID, so probe either side
+    of any split game and keep whatever turns out to be real."""
+    global probe_day
+
+    if probe_day != today:
+        # New day, forget yesterday's probing.
+        probe_day = today
+        probed_pks.clear()
+        discovered_pks.clear()
+
+    candidates = set(EXTRA_GAME_PKS)
+
+    for game in games:
+        if str(game.get("doubleHeader", "N")).upper() in {"S", "Y"}:
+            pk = game.get("gamePk")
+
+            if isinstance(pk, int):
+                candidates.update({pk - 1, pk + 1})
+
+    found = []
+
+    for pk in sorted(candidates | discovered_pks):
+        if pk in seen_pks:
+            continue
+
+        # Probe each unknown ID once per day; keep re-reading ones that
+        # turned out to be real games.
+        if pk in probed_pks and pk not in discovered_pks:
+            continue
+
+        probed_pks.add(pk)
+        entry = schedule_entry_from_feed(pk)
+
+        if not entry:
+            continue
+
+        entry_date = str(entry.get("gameDate", ""))[:10]
+
+        # Only adopt it if it is actually being played around now.
+        if entry_date and entry_date < today:
+            continue
+
+        discovered_pks.add(pk)
+        seen_pks.add(pk)
+        found.append(entry)
+        log(f"Adopted game {pk} missing from the schedule listing.")
+
+    return found
+
+
 def check_scores():
+    """One full pass over today's schedule."""
     global live_now, game_lines, sched_total, sched_range
 
     live_count = 0
     lines = []
-    """One full pass over today's schedule."""
+
     now = datetime.now(ZoneInfo("America/New_York"))
 
     # Two requests, merged. The range form covers late games past midnight
@@ -380,6 +491,8 @@ def check_scores():
 
                 seen_pks.add(game_pk)
                 games.append(game)
+
+    games.extend(find_missing_doubleheader_games(games, seen_pks, end_date))
 
     sched_total = len(games)
     sched_range = f"{start_date} to {end_date} ({len(payloads)} queries)"
