@@ -409,6 +409,54 @@ def schedule_entry_from_feed(game_pk):
     }
 
 
+def refresh_stale_entries(games, today):
+    """A postponed game keeps its ID when it is made up, and the schedule
+    entry can still read Final/Postponed while the game is being played.
+    Ask the feed about those IDs and use its answer instead."""
+    global extra_note
+
+    by_pk = {g.get("gamePk"): i for i, g in enumerate(games)}
+    suspect = set(EXTRA_GAME_PKS)
+
+    for game in games:
+        detailed = str(game.get("status", {}).get("detailedState", "")).lower()
+
+        if "postponed" in detailed or "suspended" in detailed:
+            suspect.add(game.get("gamePk"))
+
+    for pk in sorted(p for p in suspect if isinstance(p, int)):
+        entry = schedule_entry_from_feed(pk)
+
+        if not entry:
+            if pk in EXTRA_GAME_PKS:
+                extra_note = f"{pk}: feed failed -> {probe_note}"
+            continue
+
+        state = entry.get("status", {}).get("abstractGameState")
+        entry_date = str(entry.get("gameDate", ""))[:10]
+
+        # Only trust the feed over the schedule when the game is actually
+        # happening now.
+        if state != "Live" and entry_date != today:
+            if pk in EXTRA_GAME_PKS:
+                extra_note = f"{pk}: feed says {state} on {entry_date}"
+            continue
+
+        if pk in by_pk:
+            games[by_pk[pk]] = entry
+        else:
+            games.append(entry)
+
+        discovered_pks.add(pk)
+
+        if pk in EXTRA_GAME_PKS:
+            extra_note = f"{pk}: refreshed to {state}"
+        else:
+            log(f"Refreshed postponed game {pk}: feed says {state}")
+
+    return games
+
+
 def find_missing_doubleheader_games(games, seen_pks, today):
     """MLB's schedule has been seen to return only one game of a split
     doubleheader. The twin sits at an adjacent ID, so probe either side
@@ -523,6 +571,7 @@ def check_scores():
                 seen_pks.add(game_pk)
                 games.append(game)
 
+    games = refresh_stale_entries(games, end_date)
     games.extend(find_missing_doubleheader_games(games, seen_pks, end_date))
 
     sched_total = len(games)
