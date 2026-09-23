@@ -46,6 +46,7 @@ last_post_at = None
 last_post_error = None
 blocked_until = 0
 live_now = 0
+game_lines = []
 
 # How long to stay quiet after Discord IP-blocks us.
 BLOCK_COOLDOWN = 900
@@ -332,9 +333,10 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
 
 
 def check_scores():
-    global live_now
+    global live_now, game_lines
 
     live_count = 0
+    lines = []
     """One full pass over today's schedule."""
     now = datetime.now(ZoneInfo("America/New_York"))
 
@@ -436,6 +438,24 @@ def check_scores():
         game_statuses[game_pk] = status or detailed_status
 
         # Only process live, ongoing games.
+        # Record what MLB says about every game we are shown, so a game
+        # that gets filtered out is visible rather than silently absent.
+        try:
+            teams_block = game.get("teams", {})
+            away_nm = teams_block.get("away", {}).get("team", {}).get(
+                "abbreviation"
+            ) or teams_block.get("away", {}).get("team", {}).get("name", "?")
+            home_nm = teams_block.get("home", {}).get("team", {}).get(
+                "abbreviation"
+            ) or teams_block.get("home", {}).get("team", {}).get("name", "?")
+
+            if not (is_final_status(status) or is_final_status(detailed_status)):
+                lines.append(
+                    f"{away_nm}@{home_nm} [{status} / {detailed_status}]"
+                )
+        except Exception:
+            pass
+
         # MLB files Warmup and Pre-Game under the "Live" umbrella. No plays
         # exist yet, so skip them or the live count reads high.
         if status != "Live" or detailed_status in {"Warmup", "Pre-Game"}:
@@ -521,6 +541,7 @@ def check_scores():
             continue
 
     live_now = live_count
+    game_lines = lines
 
 
 def run_bot():
@@ -602,6 +623,10 @@ STATUS_TEMPLATE = """<!doctype html>
   .v {{ color: #f0f2f4; text-align: right; word-break: break-word; }}
   .err {{ color: #e5807a; }}
   footer {{ margin-top: 18px; font-size: 12px; color: #6b727d; }}
+  .games {{
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid #262a31;
+    font-size: 12px; color: #9aa2ad; line-height: 1.7;
+  }}
 </style></head>
 <body><div class="card">
   <h1><span class="dot"></span>MLB Alert Bot</h1>
@@ -617,6 +642,7 @@ STATUS_TEMPLATE = """<!doctype html>
   <div class="row"><span class="k">last post</span><span class="v">{last_post}</span></div>
   <div class="row"><span class="k">last post error</span><span class="v {post_err_class}">{post_error}</span></div>
   <div class="row"><span class="k">last loop error</span><span class="v {err_class}">{error}</span></div>
+  <div class="games">{games_block}</div>
   <footer>refreshes every 15s</footer>
 </div></body></html>
 """
@@ -657,6 +683,13 @@ def build_status():
     else:
         block_state = "clear"
 
+    if game_lines:
+        games_block = "<br>".join(
+            line.replace("&", "&amp;").replace("<", "&lt;") for line in game_lines
+        )
+    else:
+        games_block = "no games in progress"
+
     html = STATUS_TEMPLATE.format(
         dot="#57c07d" if healthy else "#e5807a",
         alive="running" if alive else "STOPPED",
@@ -675,6 +708,7 @@ def build_status():
         post_err_class="err" if last_post_error else "",
         error=last_error or "none",
         err_class="err" if last_error else "",
+        games_block=games_block,
     )
 
     return html.encode("utf-8")
