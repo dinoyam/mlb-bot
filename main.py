@@ -47,6 +47,8 @@ last_post_error = None
 blocked_until = 0
 live_now = 0
 game_lines = []
+sched_total = 0
+sched_range = ""
 
 # How long to stay quiet after Discord IP-blocks us.
 BLOCK_COOLDOWN = 900
@@ -337,7 +339,7 @@ def get_score_update_message(feed, all_plays, away_score, home_score, linescore)
 
 
 def check_scores():
-    global live_now, game_lines
+    global live_now, game_lines, sched_total, sched_range
 
     live_count = 0
     lines = []
@@ -369,6 +371,9 @@ def check_scores():
 
             seen_pks.add(game_pk)
             games.append(game)
+
+    sched_total = len(games)
+    sched_range = f"{start_date} to {end_date}"
 
     # Process every game independently so one bad game feed cannot stop
     # the remaining games from being checked.
@@ -454,9 +459,14 @@ def check_scores():
                 "abbreviation"
             ) or teams_block.get("home", {}).get("team", {}).get("name", "?")
 
+            dh_flag = game.get("doubleHeader", "?")
+            game_no = game.get("gameNumber", "?")
+            game_date = str(game.get("gameDate", ""))[:10]
+
             if not (is_final_status(status) or is_final_status(detailed_status)):
                 lines.append(
-                    f"{away_nm}@{home_nm} [{status} / {detailed_status}]"
+                    f"{away_nm}@{home_nm} [{status}/{detailed_status}] "
+                    f"pk={game_pk} g{game_no} dh={dh_flag} {game_date}"
                 )
         except Exception:
             pass
@@ -689,11 +699,12 @@ def build_status():
         block_state = "clear"
 
     if game_lines:
-        games_block = "<br>".join(
+        header = f"schedule: {sched_total} games, {sched_range}<br><br>"
+        games_block = header + "<br>".join(
             line.replace("&", "&amp;").replace("<", "&lt;") for line in game_lines
         )
     else:
-        games_block = "no games in progress"
+        games_block = f"schedule: {sched_total} games, {sched_range}<br><br>no games in progress"
 
     html = STATUS_TEMPLATE.format(
         dot="#57c07d" if healthy else "#e5807a",
