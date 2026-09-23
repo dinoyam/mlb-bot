@@ -57,6 +57,7 @@ discovered_pks = set()
 probed_pks = set()
 probe_day = None
 probe_note = "none"
+extra_note = "none"
 
 # Manual escape hatch: set EXTRA_GAME_PKS="824785,824786" in Render.
 EXTRA_GAME_PKS = {
@@ -412,7 +413,7 @@ def find_missing_doubleheader_games(games, seen_pks, today):
     """MLB's schedule has been seen to return only one game of a split
     doubleheader. The twin sits at an adjacent ID, so probe either side
     of any split game and keep whatever turns out to be real."""
-    global probe_day
+    global probe_day, extra_note
 
     if probe_day != today:
         # New day, forget yesterday's probing.
@@ -434,13 +435,19 @@ def find_missing_doubleheader_games(games, seen_pks, today):
     # Manual IDs are adopted unconditionally — no probing rules apply.
     for pk in sorted(EXTRA_GAME_PKS | discovered_pks):
         if pk in seen_pks:
+            extra_note = f"{pk}: already in schedule"
             continue
 
         entry = schedule_entry_from_feed(pk)
 
         if not entry:
+            extra_note = f"{pk}: feed failed -> {probe_note}"
             continue
 
+        extra_note = (
+            f"{pk}: adopted "
+            f"{entry.get('status', {}).get('abstractGameState')}"
+        )
         discovered_pks.add(pk)
         seen_pks.add(pk)
         found.append(entry)
@@ -847,7 +854,7 @@ def build_status():
     probe_line = (
         f"extras={sorted(EXTRA_GAME_PKS) or '-'} "
         f"adopted={sorted(discovered_pks) or '-'} "
-        f"probe: {probe_note}"
+        f"probe: {probe_note} | extra: {extra_note}"
     )
 
     if game_lines:
