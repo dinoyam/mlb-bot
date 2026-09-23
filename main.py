@@ -56,6 +56,7 @@ sched_range = ""
 discovered_pks = set()
 probed_pks = set()
 probe_day = None
+probe_note = "none"
 
 # Manual escape hatch: set EXTRA_GAME_PKS="824785,824786" in Render.
 EXTRA_GAME_PKS = {
@@ -356,19 +357,29 @@ def schedule_entry_from_feed(game_pk):
     """Ask the game feed directly about one ID and shape it like a
     schedule entry, so a game missing from the schedule can still be
     tracked by the normal loop."""
+    global probe_note
+
     try:
-        feed = requests.get(
+        response = requests.get(
             GAME_FEED_URL.format(game_pk=game_pk),
-            timeout=10,
-        ).json()
-    except Exception:
+            timeout=15,
+        )
+        feed = response.json()
+    except Exception as probe_error:
+        probe_note = f"{game_pk}: {str(probe_error)[:90]}"
         return None
 
     game_data = feed.get("gameData", {})
     status = game_data.get("status", {})
 
     if not status:
+        probe_note = f"{game_pk}: no gameData.status (keys={list(feed)[:4]})"
         return None
+
+    probe_note = (
+        f"{game_pk}: ok {status.get('abstractGameState')}/"
+        f"{status.get('detailedState')}"
+    )
 
     teams = game_data.get("teams", {})
     linescore_teams = (
@@ -833,13 +844,25 @@ def build_status():
     else:
         block_state = "clear"
 
+    probe_line = (
+        f"extras={sorted(EXTRA_GAME_PKS) or '-'} "
+        f"adopted={sorted(discovered_pks) or '-'} "
+        f"probe: {probe_note}"
+    )
+
     if game_lines:
-        header = f"schedule: {sched_total} games, {sched_range}<br><br>"
+        header = (
+            f"schedule: {sched_total} games, {sched_range}<br>"
+            f"{probe_line}<br><br>"
+        )
         games_block = header + "<br>".join(
             line.replace("&", "&amp;").replace("<", "&lt;") for line in game_lines
         )
     else:
-        games_block = f"schedule: {sched_total} games, {sched_range}<br><br>no games in progress"
+        games_block = (
+            f"schedule: {sched_total} games, {sched_range}<br>"
+            f"{probe_line}<br><br>no games in progress"
+        )
 
     html = STATUS_TEMPLATE.format(
         dot="#57c07d" if healthy else "#e5807a",
