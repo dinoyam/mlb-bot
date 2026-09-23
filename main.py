@@ -15,10 +15,11 @@ if not DISCORD_WEBHOOK_URL:
         "DISCORD_WEBHOOK_URL is not set. Add it under Environment in Render."
     )
 
-SCHEDULE_URL = (
+SCHEDULE_RANGE_URL = (
     "https://statsapi.mlb.com/api/v1/schedule"
     "?sportId=1&startDate={start_date}&endDate={end_date}"
 )
+SCHEDULE_DAY_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
 GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 
 # Embed sidebar colors.
@@ -346,34 +347,42 @@ def check_scores():
     """One full pass over today's schedule."""
     now = datetime.now(ZoneInfo("America/New_York"))
 
-    # Ask for a few days back, not just today. Two reasons: a game that
-    # starts at 10pm ET is still being played after midnight, and a
-    # postponed or suspended game is often still filed under its ORIGINAL
-    # date even when it is actually played days later.
+    # Two requests, merged. The range form covers late games past midnight
+    # and postponed games filed under an earlier date, but it has been seen
+    # to omit games — notably game one of a split doubleheader. The
+    # single-date form returns those, so ask for both and take the union.
     start_date = (now - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
 
-    schedule_data = requests.get(
-        SCHEDULE_URL.format(start_date=start_date, end_date=end_date),
-        timeout=10,
-    ).json()
+    payloads = []
+
+    for url in (
+        SCHEDULE_RANGE_URL.format(start_date=start_date, end_date=end_date),
+        SCHEDULE_DAY_URL.format(date=end_date),
+        SCHEDULE_DAY_URL.format(date=start_date),
+    ):
+        try:
+            payloads.append(requests.get(url, timeout=10).json())
+        except Exception as sched_error:
+            log(f"Schedule fetch failed for {url}: {sched_error}")
 
     # The same game can only appear once, but dedupe by gamePk to be safe.
     games = []
     seen_pks = set()
 
-    for schedule_date in schedule_data.get("dates", []):
-        for game in schedule_date.get("games", []):
-            game_pk = game.get("gamePk")
+    for schedule_data in payloads:
+        for schedule_date in schedule_data.get("dates", []):
+            for game in schedule_date.get("games", []):
+                game_pk = game.get("gamePk")
 
-            if game_pk in seen_pks:
-                continue
+                if game_pk in seen_pks:
+                    continue
 
-            seen_pks.add(game_pk)
-            games.append(game)
+                seen_pks.add(game_pk)
+                games.append(game)
 
     sched_total = len(games)
-    sched_range = f"{start_date} to {end_date}"
+    sched_range = f"{start_date} to {end_date} ({len(payloads)} queries)"
 
     # Process every game independently so one bad game feed cannot stop
     # the remaining games from being checked.
