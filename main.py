@@ -409,7 +409,7 @@ def find_missing_doubleheader_games(games, seen_pks, today):
         probed_pks.clear()
         discovered_pks.clear()
 
-    candidates = set(EXTRA_GAME_PKS)
+    candidates = set()
 
     for game in games:
         if str(game.get("doubleHeader", "N")).upper() in {"S", "Y"}:
@@ -420,25 +420,38 @@ def find_missing_doubleheader_games(games, seen_pks, today):
 
     found = []
 
-    for pk in sorted(candidates | discovered_pks):
+    # Manual IDs are adopted unconditionally — no probing rules apply.
+    for pk in sorted(EXTRA_GAME_PKS | discovered_pks):
         if pk in seen_pks:
             continue
 
-        # Probe each unknown ID once per day; keep re-reading ones that
-        # turned out to be real games.
-        if pk in probed_pks and pk not in discovered_pks:
-            continue
-
-        probed_pks.add(pk)
         entry = schedule_entry_from_feed(pk)
 
         if not entry:
             continue
 
-        entry_date = str(entry.get("gameDate", ""))[:10]
+        discovered_pks.add(pk)
+        seen_pks.add(pk)
+        found.append(entry)
 
-        # Only adopt it if it is actually being played around now.
-        if entry_date and entry_date < today:
+    for pk in sorted(candidates):
+        if pk in seen_pks or pk in probed_pks:
+            continue
+
+        entry = schedule_entry_from_feed(pk)
+
+        if entry is None:
+            # Could be a transient failure, so do NOT blacklist it —
+            # let the next cycle try again.
+            continue
+
+        entry_date = str(entry.get("gameDate", ""))[:10]
+        state = entry.get("status", {}).get("abstractGameState")
+
+        # Adopt only a game being played today. A real answer about a
+        # game we do not want is a definitive no, so stop probing it.
+        if entry_date != today and state != "Live":
+            probed_pks.add(pk)
             continue
 
         discovered_pks.add(pk)
