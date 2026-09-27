@@ -7,8 +7,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-import ballparks
-
 # Set DISCORD_WEBHOOK_URL in Render: Dashboard > your service > Environment.
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
@@ -28,17 +26,10 @@ GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 HOME_RUN_COLOR = 0xE8A33D   # amber
 SCORE_COLOR = 0x4B8BF5      # blue
 FINAL_COLOR = 0x8A8F98      # gray
-NEAR_HR_COLOR = 0xE0405A    # red
-
-# Most near misses a single game may report, so one windy night in
-# Denver cannot bury the channel. Thresholds live in ballparks.py.
-MAX_NEAR_PER_GAME = 5
 
 TEAM_LOGO_URL = "https://midfield.mlbstatic.com/v1/team/{team_id}/spots/500"
 
 sent_alerts = set()
-near_alerts = set()
-near_counts = {}
 score_snapshots = {}
 game_statuses = {}
 final_alerts = set()
@@ -243,95 +234,6 @@ def build_embed(color, header, title, description, score_line, inning, outs):
             }
         ]
     }
-
-
-def get_hit_data(play):
-    """The batted-ball measurements hang off the pitch that was hit."""
-    for event in reversed(play.get("playEvents", [])):
-        hit_data = event.get("hitData")
-
-        if hit_data:
-            return hit_data, event
-
-    return None, None
-
-
-def get_near_hr_message(feed, play, verdict, pitch_event):
-    game_data = feed.get("gameData", {})
-    matchup = play.get("matchup", {})
-    batter_name = get_batter_name(feed, matchup)
-    pitcher_name = matchup.get("pitcher", {}).get("fullName", "Unknown")
-
-    about = play.get("about", {})
-    is_top = bool(about.get("isTopInning"))
-
-    teams = game_data.get("teams", {})
-    batting_side = "away" if is_top else "home"
-    batting_team = teams.get(batting_side, {})
-    team_name = batting_team.get("name", "?")
-    team_id = batting_team.get("id")
-
-    away = teams.get("away", {})
-    home = teams.get("home", {})
-    away_ticker = away.get("abbreviation", away.get("name", "AWAY"))
-    home_ticker = home.get("abbreviation", home.get("name", "HOME"))
-
-    linescore = feed.get("liveData", {}).get("linescore", {})
-    ls_teams = linescore.get("teams", {})
-    away_runs = ls_teams.get("away", {}).get("runs", 0)
-    home_runs = ls_teams.get("home", {}).get("runs", 0)
-
-    venue = game_data.get("venue", {}).get("name", "?")
-    result = play.get("result", {}).get("event", "In play")
-
-    details = (pitch_event or {}).get("details", {})
-    pitch_name = (details.get("type") or {}).get("description", "Pitch")
-    pitch_speed = (pitch_event or {}).get("pitchData", {}).get("startSpeed")
-
-    if isinstance(pitch_speed, (int, float)):
-        pitch_text = f"{pitch_name} \u00b7 {pitch_speed:.1f} mph"
-    else:
-        pitch_text = pitch_name
-
-    game_date = str(game_data.get("datetime", {}).get("officialDate", ""))
-
-    try:
-        pretty_date = datetime.strptime(game_date, "%Y-%m-%d").strftime(
-            "%b %-d, %Y"
-        ).upper()
-    except Exception:
-        pretty_date = game_date
-
-    half = "TOP" if is_top else "BOT"
-    inning = about.get("inning", "?")
-    footer = (
-        f"{pretty_date}  |  {half} {inning}  |  "
-        f"{away_ticker} {away_runs} - {home_runs} {home_ticker}"
-    )
-
-    embed = {
-        "color": NEAR_HR_COLOR,
-        "author": {"name": "NEAR HOME RUN"},
-        "title": batter_name,
-        "description": f"{team_name} \u2014 {verdict['summary']}",
-        "fields": [
-            {"name": "Distance", "value": verdict["distance"], "inline": True},
-            {"name": "Exit Velocity", "value": verdict["exit_velocity"], "inline": True},
-            {"name": "Launch Angle", "value": verdict["launch_angle"], "inline": True},
-            {"name": "Park", "value": venue, "inline": True},
-            {"name": "Wall Here", "value": verdict["wall"], "inline": True},
-            {"name": "Missed By", "value": verdict["missed_by"], "inline": True},
-            {"name": "Result", "value": result, "inline": True},
-            {"name": "Pitcher", "value": pitcher_name, "inline": True},
-            {"name": "Pitch", "value": pitch_text, "inline": True},
-        ],
-        "footer": {"text": footer},
-    }
-
-    if team_id:
-        embed["thumbnail"] = {"url": TEAM_LOGO_URL.format(team_id=team_id)}
-
-    return {"embeds": [embed]}
 
 
 def get_home_run_message(feed, play):
@@ -851,58 +753,27 @@ def check_scores():
 
             score_snapshots[game_pk] = current_scores
 
-            # Check every play, newest first, for unreported home runs
-            # and near misses.
-            venue_name = feed.get("gameData", {}).get("venue", {}).get("name")
-
+            # Check every play, newest first, for unreported home runs.
             for play in reversed(all_plays):
                 result = play.get("result", {})
                 about = play.get("about", {})
-                event_name = result.get("event")
+
+                if result.get("event") != "Home Run":
+                    continue
 
                 play_key = about.get("playId") or about.get("atBatIndex")
                 play_id = f"{game_pk}_{play_key}"
 
-                if event_name == "Home Run":
-                    if play_id in sent_alerts:
-                        continue
-
-                    if is_first_look:
-                        sent_alerts.add(play_id)
-                        continue
-
-                    if post_to_discord(get_home_run_message(feed, play)):
-                        sent_alerts.add(play_id)
-
-                    continue
-
-                # Near miss: a batted ball that almost cleared the fence.
-                if play_id in near_alerts:
-                    continue
-
-                hit_data, pitch_event = get_hit_data(play)
-
-                if not hit_data:
-                    continue
-
-                verdict = ballparks.evaluate_batted_ball(venue_name, hit_data)
-
-                if not verdict:
+                if play_id in sent_alerts:
                     continue
 
                 if is_first_look:
-                    near_alerts.add(play_id)
+                    # Already happened before we started watching.
+                    sent_alerts.add(play_id)
                     continue
 
-                if near_counts.get(game_pk, 0) >= MAX_NEAR_PER_GAME:
-                    near_alerts.add(play_id)
-                    continue
-
-                if post_to_discord(
-                    get_near_hr_message(feed, play, verdict, pitch_event)
-                ):
-                    near_alerts.add(play_id)
-                    near_counts[game_pk] = near_counts.get(game_pk, 0) + 1
+                if post_to_discord(get_home_run_message(feed, play)):
+                    sent_alerts.add(play_id)
 
             seeded_games.add(game_pk)
 
