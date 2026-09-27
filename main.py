@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -50,6 +51,8 @@ last_post_error = None
 blocked_until = 0
 block_streak = 0
 last_block_at = 0
+pending_posts = deque()
+posts_expired = 0
 live_now = 0
 game_lines = []
 sched_total = 0
@@ -77,6 +80,11 @@ MIN_BLOCK_COOLDOWN = 90     # seconds
 MAX_BLOCK_COOLDOWN = 900    # seconds
 BLOCK_STREAK_WINDOW = 1800  # blocks closer than this count as a streak
 
+# Messages held while blocked, so a block costs delay rather than
+# lost alerts. Anything older than MAX_QUEUE_AGE is stale and dropped.
+MAX_QUEUED = 25
+MAX_QUEUE_AGE = 900         # seconds
+
 # Days of schedule to request. Covers late games past midnight and
 # postponed or resumed games still filed under an earlier date.
 LOOKBACK_DAYS = 4
@@ -97,9 +105,13 @@ def post_to_discord(payload):
         payload = {"content": payload}
 
     # Discord has IP-blocked us. Sending more requests only extends the
-    # block, so drop the message rather than queue a flood for later.
+    # block, so hold the message and send it once the block clears.
     if time.time() < blocked_until:
-        posts_skipped += 1
+        if len(pending_posts) >= MAX_QUEUED:
+            pending_posts.popleft()
+            posts_skipped += 1
+
+        pending_posts.append((time.time(), payload))
         return True
 
     for attempt in range(5):
@@ -143,6 +155,11 @@ def post_to_discord(payload):
 
                     blocked_until = now_ts + cooldown
                     posts_failed += 1
+
+                    # Hold this one as well rather than losing it.
+                    if len(pending_posts) < MAX_QUEUED:
+                        pending_posts.append((now_ts, payload))
+
                     log(
                         f"Discord IP block (#{block_streak}). Pausing posts "
                         f"for {cooldown / 60:.1f} minutes."
@@ -176,6 +193,35 @@ def post_to_discord(payload):
 
     posts_failed += 1
     return False
+
+
+def flush_pending():
+    """Send anything held during a block, oldest first. Stale messages
+    are dropped — a home run alert 20 minutes late is just confusing."""
+    global posts_expired
+
+    if not pending_posts or time.time() < blocked_until:
+        return
+
+    now_ts = time.time()
+
+    while pending_posts:
+        queued_at, payload = pending_posts[0]
+
+        if now_ts - queued_at > MAX_QUEUE_AGE:
+            pending_posts.popleft()
+            posts_expired += 1
+            continue
+
+        # Stop if a send re-triggers the block; the rest stays queued.
+        if not post_to_discord(payload):
+            return
+
+        if pending_posts and pending_posts[0][1] is payload:
+            pending_posts.popleft()
+
+        if time.time() < blocked_until:
+            return
 
 
 def is_final_status(status):
@@ -559,6 +605,9 @@ def check_scores():
     live_count = 0
     lines = []
 
+    # Anything held during a block goes out first.
+    flush_pending()
+
     now = datetime.now(ZoneInfo("America/New_York"))
 
     # Two requests, merged. The range form covers late games past midnight
@@ -878,7 +927,8 @@ STATUS_TEMPLATE = """<!doctype html>
   <div class="row"><span class="k">games seen</span><span class="v">{games}</span></div>
   <div class="row"><span class="k">posts sent ok</span><span class="v">{posts_ok}</span></div>
   <div class="row"><span class="k">posts failed</span><span class="v {fail_class}">{posts_failed}</span></div>
-  <div class="row"><span class="k">dropped while blocked</span><span class="v">{posts_skipped}</span></div>
+  <div class="row"><span class="k">queued (waiting)</span><span class="v">{queued}</span></div>
+  <div class="row"><span class="k">dropped (stale/full)</span><span class="v">{dropped}</span></div>
   <div class="row"><span class="k">discord block</span><span class="v {block_class}">{block_state}</span></div>
   <div class="row"><span class="k">last post</span><span class="v">{last_post}</span></div>
   <div class="row"><span class="k">last post error</span><span class="v {post_err_class}">{post_error}</span></div>
@@ -954,7 +1004,8 @@ def build_status():
         posts_ok=posts_ok,
         posts_failed=posts_failed,
         fail_class="err" if posts_failed else "",
-        posts_skipped=posts_skipped,
+        queued=len(pending_posts),
+        dropped=posts_skipped + posts_expired,
         block_state=block_state,
         block_class="err" if remaining > 0 else "",
         last_post=humanize_age(last_post_at),
