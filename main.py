@@ -27,10 +27,18 @@ GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 HOME_RUN_COLOR = 0xE8A33D   # amber
 SCORE_COLOR = 0x4B8BF5      # blue
 FINAL_COLOR = 0x8A8F98      # gray
+PITCHING_COLOR = 0x3BA99C   # teal
+
+# True = only announce when the starting pitcher leaves.
+# False = announce every pitching change.
+STARTER_EXITS_ONLY = False
 
 TEAM_LOGO_URL = "https://midfield.mlbstatic.com/v1/team/{team_id}/spots/500"
 
 sent_alerts = set()
+
+# (game_pk, "away"/"home") -> number of pitchers that side has used.
+pitcher_counts = {}
 score_snapshots = {}
 game_statuses = {}
 final_alerts = set()
@@ -280,6 +288,77 @@ def build_embed(color, header, title, description, score_line, inning, outs):
             }
         ]
     }
+
+
+def get_pitching_change_message(feed, side, outgoing_id, incoming_id, starter_exit):
+    game_data = feed.get("gameData", {})
+    live_data = feed.get("liveData", {})
+    players = game_data.get("players", {})
+
+    def name_of(pid):
+        return players.get(f"ID{pid}", {}).get("fullName", "Unknown")
+
+    outgoing_name = name_of(outgoing_id)
+    incoming_name = name_of(incoming_id)
+
+    teams = game_data.get("teams", {})
+    pitching_team = teams.get(side, {})
+    team_name = pitching_team.get("name", "?")
+    team_id = pitching_team.get("id")
+
+    away = teams.get("away", {})
+    home = teams.get("home", {})
+    away_ticker = away.get("abbreviation", away.get("name", "AWAY"))
+    home_ticker = home.get("abbreviation", home.get("name", "HOME"))
+
+    linescore = live_data.get("linescore", {})
+    ls_teams = linescore.get("teams", {})
+    away_runs = ls_teams.get("away", {}).get("runs", 0)
+    home_runs = ls_teams.get("home", {}).get("runs", 0)
+
+    # The outgoing pitcher's line for this game.
+    box_player = (
+        live_data.get("boxscore", {})
+        .get("teams", {})
+        .get(side, {})
+        .get("players", {})
+        .get(f"ID{outgoing_id}", {})
+    )
+    pitching = box_player.get("stats", {}).get("pitching", {}) or {}
+
+    ip = pitching.get("inningsPitched", "0.0")
+    line = (
+        f"{ip} IP \u00b7 {pitching.get('hits', 0)} H \u00b7 "
+        f"{pitching.get('runs', 0)} R \u00b7 {pitching.get('earnedRuns', 0)} ER \u00b7 "
+        f"{pitching.get('baseOnBalls', 0)} BB \u00b7 {pitching.get('strikeOuts', 0)} K"
+    )
+    pitches = pitching.get("numberOfPitches", pitching.get("pitchesThrown"))
+    pitches_text = str(pitches) if pitches is not None else "\u2014"
+
+    header = "\U0001F504 STARTER EXITS" if starter_exit else "\U0001F504 PITCHING CHANGE"
+
+    embed = {
+        "color": PITCHING_COLOR,
+        "author": {"name": header},
+        "title": f"{incoming_name} replaces {outgoing_name}",
+        "description": team_name,
+        "fields": [
+            {"name": f"{outgoing_name.split()[-1]}'s line", "value": line, "inline": False},
+            {"name": "Pitches", "value": pitches_text, "inline": True},
+            {"name": "Inning", "value": get_inning_indicator(linescore), "inline": True},
+            {
+                "name": "Score",
+                "value": f"{away_ticker} {away_runs} \u00b7 {home_ticker} {home_runs}",
+                "inline": True,
+            },
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if team_id:
+        embed["thumbnail"] = {"url": TEAM_LOGO_URL.format(team_id=team_id)}
+
+    return {"embeds": [embed]}
 
 
 def get_home_run_message(feed, play):
@@ -823,6 +902,33 @@ def check_scores():
 
                 if post_to_discord(get_home_run_message(feed, play)):
                     sent_alerts.add(play_id)
+
+            # Pitching changes. Each side's pitcher list only grows when
+            # a new pitcher enters, so a longer list means a change.
+            boxscore_teams = live_data.get("boxscore", {}).get("teams", {})
+
+            for side in ("away", "home"):
+                pitchers = boxscore_teams.get(side, {}).get("pitchers", []) or []
+                key = (game_pk, side)
+                previous_count = pitcher_counts.get(key)
+                pitcher_counts[key] = len(pitchers)
+
+                # First sighting records the baseline without alerting.
+                if previous_count is None or is_first_look:
+                    continue
+
+                # Report every change since the last poll, in order.
+                for idx in range(max(previous_count, 1), len(pitchers)):
+                    starter_exit = idx == 1
+
+                    if STARTER_EXITS_ONLY and not starter_exit:
+                        continue
+
+                    post_to_discord(
+                        get_pitching_change_message(
+                            feed, side, pitchers[idx - 1], pitchers[idx], starter_exit
+                        )
+                    )
 
             seeded_games.add(game_pk)
 
